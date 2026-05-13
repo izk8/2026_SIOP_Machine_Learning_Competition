@@ -1,67 +1,34 @@
 """
-meta_analysis_test.py
----------------------
-A generalizable meta-analysis pipeline for the SIOP ML 2026.
+meta_analysis_test_fallback.py
+-------------------------------
+Same pipeline as meta_analysis_test.py, with one addition:
 
-This script reads construct definitions from a CSV
-and applies the appropriate research question, predictor, and outcome for
-each article based on its construct pair.
+  When a study yields NO valid r values (pipeline returns None), this script
+  looks up all previously-processed studies in --fallback-dir (default:
+  output_test/) that share the SAME construct pair (predictor → outcome).
+  It averages their aggregate_r values and uses that mean as the fallback
+  effect size for the study.
 
-HOW IT WORKS:
-  For each article in the test set:
-  1. Look up its construct pair in test_construct_definitions.csv
-  2. Send the PDF to Claude → screen the Methods section for matching variables
-  3. Send the PDF again → extract statistics linking matched variables
-  4. Convert all statistics to Pearson r
-  5. Average r values → aggregate effect size for that study
+  This is identical to meta_analysis_test.py in every other respect.
 
 HOW TO RUN:
-  # Using default filenames (test_articles.csv, test_construct_definitions.csv):
-  python meta_analysis_test.py
+  python meta_analysis_test_fallback.py
 
   # Specify all inputs explicitly:
-  python meta_analysis_test.py \\
+  python meta_analysis_test_fallback.py \\
       --articles test_articles.csv \\
       --constructs test_construct_definitions.csv \\
       --pdf-dir test_pdfs/ \\
       --outcsv submission_test.csv \\
-      --outdir output_test/
+      --outdir output_test/ \\
+      --fallback-dir output_test/
 
-  # Process a single PDF with a specific construct pair:
-  python meta_analysis_test.py --study-id study42
-
-  # Use the dev set (trust→wellbeing) as a smoke test:
-  python meta_analysis_test.py \\
-      --articles dev_articles.csv \\
-      --constructs dev_construct_definitions.csv \\
-      --pdf-dir pdfs/
+  # Process a single study:
+  python meta_analysis_test_fallback.py --study-id study38
 
 REQUIREMENTS:
   pip install anthropic scipy
   Set ANTHROPIC_API_KEY in environment or in a .env file.
-
-CONSTRUCT DEFINITIONS CSV FORMAT:
-  Required columns (flexible naming):
-    - A "pair ID" column: construct_pair_id, pair_id, or construct_pair
-    - research_question
-    - predictor_name   (short name, e.g. "Trust")
-    - predictor_description  (full eligibility definition)
-    - outcome_name     (short name, e.g. "Well-being")
-    - outcome_description    (full eligibility definition)
-  Optional: construct1, construct2 (alternative to pair_id; the script
-            will synthesize a pair key from them)
-
-ARTICLES CSV FORMAT:
-  Required columns:
-    - studyid (or study_id)
-    - A construct pair reference: construct_pair_id, pair_id, construct_pair,
-      or two separate columns x_construct + y_construct / construct1 + construct2
-  Optional: pdf_path (absolute or relative path to the PDF file)
-            If absent, the script looks for <pdf_dir>/<studyid>.pdf
-
-OUTPUT:
-  - submission_test.csv   — studyid, aggregateeffectsize
-  - output_test/<studyid>/  — per-study JSON artefacts and verbose log
 """
 
 import argparse
@@ -109,9 +76,7 @@ def setup_logger(save_dir):
     logger.addHandler(_file_handler)
 
 
-# ── Prompt templates (same logic as meta_analysis_simple.py) ─────────────────
-# The {predictor} and {outcome} placeholders are filled dynamically
-# from the construct definitions CSV for each article.
+# ── Prompt templates ──────────────────────────────────────────────────────────
 
 SCREENING_PROMPT = """\
 You are an expert research methodologist preparing a meta-analysis.
@@ -500,7 +465,6 @@ Return ONLY valid JSON. No other text.
 # ── Step 2.5: Quality check ───────────────────────────────────────────────────
 
 def run_quality_check(pdf_b64, client, model, construct_def, stats, screening):
-    """Ask Claude to audit the extracted statistics and return a quality report."""
     prompt = QUALITY_CHECK_PROMPT.format(
         research_question=construct_def["research_question"],
         predictor_name=construct_def["predictor_name"],
@@ -557,14 +521,9 @@ def run_quality_check(pdf_b64, client, model, construct_def, stats, screening):
 
 
 def apply_quality_corrections(stats, quality):
-    """Patch inaccurate fields and append missing statistics from the quality report.
-
-    Missing statistics are tagged with qc_added=True so they can be tracked
-    separately from originally extracted stats.
-    """
+    """Patch inaccurate fields and append missing statistics from the quality report."""
     corrected = [s.copy() for s in stats]
 
-    # Fix inaccurate fields
     numeric_fields = {
         "statistic_value", "n", "df", "p",
         "standard_error", "ci_lower", "ci_upper",
@@ -582,7 +541,6 @@ def apply_quality_corrections(stats, quality):
         if not field:
             continue
 
-        # Validate that correct_val is coercible for numeric fields BEFORE touching the stat
         coerced_val = None
         coercion_ok = False
         if correct_val is not None:
@@ -602,7 +560,6 @@ def apply_quality_corrections(stats, quality):
                     field in s):
                 continue
 
-            # Guard: only apply to the matching extracted value
             if extracted_raw is not None:
                 current = s.get(field)
                 try:
@@ -616,7 +573,6 @@ def apply_quality_corrections(stats, quality):
                     pass
 
             if coercion_ok and not needs_review:
-                # Confident numeric fix — apply it
                 s[field] = coerced_val
                 logger.info(
                     f"    [QC fix] {field} for '{s.get('predictor_variable')}'"
@@ -624,7 +580,6 @@ def apply_quality_corrections(stats, quality):
                     f"{extracted_raw} → {coerced_val}"
                 )
             else:
-                # Uncertain or uncoercible — preserve original, attach review flag
                 s.setdefault("qc_warnings", []).append({
                     "field": field,
                     "extracted_value": extracted_raw,
@@ -638,13 +593,12 @@ def apply_quality_corrections(stats, quality):
                     f"flagged for review ({review_reason[:80] or 'no reason given'})"
                 )
 
-    # Add missing statistics
     required = {"predictor_variable", "outcome_variable", "statistic_type"}
     for miss in quality.get("missing_statistics", []):
         if not required.issubset(miss.keys()):
             continue
         if miss.get("statistic_value") is None:
-            continue  # cannot convert to r without a numeric value
+            continue
         new_stat = {
             "predictor_variable": miss["predictor_variable"],
             "outcome_variable":   miss["outcome_variable"],
@@ -661,7 +615,6 @@ def apply_quality_corrections(stats, quality):
             "source_location":    miss.get("location", "quality-check addition"),
             "extraction_level":   1,
             "qc_added":           True,
-
         }
         corrected.append(new_stat)
         logger.info(
@@ -676,7 +629,6 @@ def apply_quality_corrections(stats, quality):
 # ── Helper: flexible column lookup ───────────────────────────────────────────
 
 def get_col(row, *candidates, default=None):
-    """Return the first matching column value from a CSV row dict."""
     for col in candidates:
         if col in row and row[col].strip():
             return row[col].strip()
@@ -684,7 +636,6 @@ def get_col(row, *candidates, default=None):
 
 
 def detect_encoding(csv_path):
-    """Try common encodings and return the first one that reads the file cleanly."""
     for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
         try:
             with open(csv_path, encoding=encoding) as f:
@@ -692,17 +643,12 @@ def detect_encoding(csv_path):
             return encoding
         except UnicodeDecodeError:
             continue
-    return "latin-1"  # never fails
+    return "latin-1"
 
 
 # ── Load construct definitions ────────────────────────────────────────────────
 
 def load_construct_definitions(csv_path):
-    """Load construct definitions from test_construct_definitions.csv.
-
-    Expected columns: Construct, Definition
-    Returns a dict mapping construct name (str) -> definition (str).
-    """
     definitions = {}
     with open(csv_path, newline="", encoding=detect_encoding(csv_path)) as f:
         reader = csv.DictReader(f)
@@ -719,15 +665,6 @@ def load_construct_definitions(csv_path):
 # ── Load article list ─────────────────────────────────────────────────────────
 
 def load_articles(csv_path, pdf_dir=None):
-    """Load articles from test_articles.csv.
-
-    Expected columns: studyid, Construct1, Construct2
-    Returns a list of article dicts, each with:
-      - study_id:   str
-      - construct1: str  (predictor construct name)
-      - construct2: str  (outcome construct name)
-      - pdf_path:   str or None
-    """
     articles = []
 
     with open(csv_path, newline="", encoding=detect_encoding(csv_path)) as f:
@@ -740,7 +677,6 @@ def load_articles(csv_path, pdf_dir=None):
             construct1 = get_col(row, "Construct1", "construct1", "x_construct", "predictor")
             construct2 = get_col(row, "Construct2", "construct2", "y_construct", "outcome")
 
-            # Resolve PDF path: look for <pdf_dir>/<studyid>.pdf
             pdf_path = None
             if pdf_dir:
                 candidate = os.path.join(pdf_dir, f"{study_id}.pdf")
@@ -758,10 +694,71 @@ def load_articles(csv_path, pdf_dir=None):
     return articles
 
 
+# ── Fallback index ────────────────────────────────────────────────────────────
+
+def load_fallback_index(fallback_dir):
+    """Scan fallback_dir for result.json files and build a mapping:
+      pair_id (normalised) -> list of (study_id, aggregate_r) tuples
+    Only includes studies that produced a non-None aggregate_r.
+    """
+    index = {}  # pair_id_key -> [(study_id, r), ...]
+
+    if not fallback_dir or not os.path.isdir(fallback_dir):
+        return index
+
+    for entry in os.scandir(fallback_dir):
+        if not entry.is_dir():
+            continue
+        result_path = os.path.join(entry.path, "result.json")
+        if not os.path.exists(result_path):
+            continue
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        agg_r = data.get("aggregate_r")
+        if agg_r is None:
+            continue
+
+        pair_id = (data.get("pair_id") or "").strip()
+        if not pair_id:
+            continue
+
+        key = pair_id.lower()
+        index.setdefault(key, []).append((entry.name, float(agg_r), pair_id))
+
+    n_pairs = len(index)
+    n_studies = sum(len(v) for v in index.values())
+    logger.info(
+        f"  Fallback index loaded: {n_studies} studies across {n_pairs} construct pair(s)"
+    )
+    return index
+
+
+def compute_fallback_r(pair_id, fallback_index, exclude_study_id=None):
+    """Return the mean aggregate_r across all studies in fallback_index that share
+    the same pair_id, excluding exclude_study_id. Returns (mean_r, sources) or
+    (None, []) if no matching studies exist.
+    """
+    key = (pair_id or "").strip().lower()
+    entries = fallback_index.get(key, [])
+    valid = [
+        (sid, r, pid) for sid, r, pid in entries
+        if exclude_study_id is None or sid != exclude_study_id
+    ]
+    if not valid:
+        return None, []
+
+    mean_r = sum(r for _, r, _ in valid) / len(valid)
+    sources = [{"study_id": sid, "aggregate_r": r} for sid, r, _ in valid]
+    return mean_r, sources
+
+
 # ── Step 1: Screen variables ──────────────────────────────────────────────────
 
 def screen_variables(pdf_b64, client, model, construct_def):
-    """Ask Claude to read the Methods section and identify matching variables."""
     prompt = SCREENING_PROMPT.format(
         research_question=construct_def["research_question"],
         predictor_name=construct_def["predictor_name"],
@@ -842,7 +839,6 @@ def screen_variables(pdf_b64, client, model, construct_def):
 # ── Step 2: Extract statistics ────────────────────────────────────────────────
 
 def extract_stats_from_pdf(pdf_path, client, model, construct_def):
-    """Two-step pipeline: screen variables then extract statistics."""
     with open(pdf_path, "rb") as f:
         pdf_b64 = base64.b64encode(f.read()).decode("ascii")
 
@@ -940,7 +936,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
 
     stats = [s for s in stats if isinstance(s, dict)]
 
-    # ── Enforce single extraction level ──────────────────────────────────────
     LEVEL_1_TYPES = {"r", "partialr"}
     LEVEL_2_TYPES = {"contingency2x2", "meansdgroups", "meansdgroupsextreme",
                      "ordinalgroups", "ponly", "t", "f", "chi2", "d", "g"}
@@ -965,7 +960,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
             f"keeping only level {best} ({n_before} → {len(stats)} stats)"
         )
 
-    # ── Drop contingency_2x2 with null cells ─────────────────────────────────
     valid_stats = []
     for s in stats:
         stype = (s.get("statistic_type") or "").lower().replace("-", "").replace("_", "")
@@ -981,7 +975,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
         valid_stats.append(s)
     stats = valid_stats
 
-    # ── Validate ordinal_groups entries ───────────────────────────────────────
     valid_stats = []
     for s in stats:
         stype = (s.get("statistic_type") or "").lower().replace("-", "").replace("_", "")
@@ -1001,7 +994,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
         valid_stats.append(s)
     stats = valid_stats
 
-    # ── Deduplicate contingency_2x2 with identical cells ─────────────────────
     seen_cells = set()
     deduped_stats = []
     for s in stats:
@@ -1019,7 +1011,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
         deduped_stats.append(s)
     stats = deduped_stats
 
-    # ── Fix reverse_coded using screening data ────────────────────────────────
     neg_pole_vars = set()
     for v in screening.get("variables", []):
         if v.get("negative_pole"):
@@ -1042,7 +1033,6 @@ def extract_stats_from_pdf(pdf_path, client, model, construct_def):
             )
             s["reverse_coded"] = correct_rev
 
-    # Log each extracted statistic
     for i, s in enumerate(stats):
         pred = s.get("predictor_variable", "?")
         outc = s.get("outcome_variable", "?")
@@ -1291,11 +1281,6 @@ def convert_to_r(stat):
 # ── Build construct_def for a study ──────────────────────────────────────────
 
 def build_construct_def(article, definitions):
-    """Look up Construct1 and Construct2 from the definitions dict and return
-    a construct_def dict for use in the extraction pipeline.
-
-    Returns None if either construct is missing from definitions.
-    """
     c1 = article.get("construct1")
     c2 = article.get("construct2")
 
@@ -1331,7 +1316,6 @@ def build_construct_def(article, definitions):
 
 def process_one_study(article, construct_def, api_key, model, save_dir,
                       skip_quality_check=False):
-    """Process a single study and return the aggregate effect size (Pearson r)."""
     study_id = article["study_id"]
     pdf_path = article.get("pdf_path")
 
@@ -1368,7 +1352,6 @@ def process_one_study(article, construct_def, api_key, model, save_dir,
     with open(os.path.join(save_dir, "extracted_stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
-    # Step 2.5: Quality check and self-correction
     quality = {}
     if not skip_quality_check:
         logger.info("  [Step 2.5] Running quality check...")
@@ -1399,7 +1382,6 @@ def process_one_study(article, construct_def, api_key, model, save_dir,
             + (f" ({n_added:+d} from QC)" if n_added else "")
         )
 
-        # Attach per-stat accuracy scores from QC
         per_stat_acc = {
             (e.get("predictor_variable", "").strip().lower(),
              e.get("outcome_variable", "").strip().lower()): e.get("accuracy_score", 10)
@@ -1412,7 +1394,6 @@ def process_one_study(article, construct_def, api_key, model, save_dir,
             )
             s["accuracy_score"] = per_stat_acc.get(key, 10)
 
-    # Convert to Pearson r
     logger.info("  [Step 3] Converting to Pearson r:")
     r_values = []
     r_values_qc_added = []
@@ -1468,7 +1449,6 @@ def process_one_study(article, construct_def, api_key, model, save_dir,
                 f"QC-added r values: {[round(v, 4) for v in r_values_qc_added]}"
             )
 
-    # Compute original-only aggregate for comparison (excludes QC-added stats)
     r_original_only = [c["r"] for c in r_conversions if not c.get("qc_added")]
     aggregate_r_original = (
         sum(r_original_only) / len(r_original_only) if r_original_only else aggregate_r
@@ -1501,9 +1481,9 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Generalizable meta-analysis pipeline for the SIOP ML 2026. "
-            "Reads construct definitions and article list from CSV files, "
-            "then extracts effect sizes from PDFs using Claude AI."
+            "Meta-analysis pipeline with construct-pair fallback. "
+            "When a study yields no valid r values, uses the mean aggregate_r "
+            "from studies in --fallback-dir that share the same construct pair."
         )
     )
     parser.add_argument(
@@ -1530,12 +1510,18 @@ def main():
         help="Claude model to use (default: claude-opus-4-6).",
     )
     parser.add_argument(
-        "--outcsv", default="submission_test.csv",
-        help="Output submission CSV path (default: submission_test.csv).",
+        "--outcsv", default="submission_fallback.csv",
+        help="Output submission CSV path (default: submission_fallback.csv).",
     )
     parser.add_argument(
         "--outdir", default="output_test",
         help="Folder for per-study result files (default: output_test/).",
+    )
+    parser.add_argument(
+        "--fallback-dir", default="output_test",
+        help="Folder of previously-processed studies to draw fallback r values from "
+             "(default: output_test/). Studies with the same construct pair and a "
+             "non-null aggregate_r contribute to the fallback mean.",
     )
     parser.add_argument(
         "--study-id", nargs="+", default=None,
@@ -1547,29 +1533,31 @@ def main():
     )
     args = parser.parse_args()
 
-    # Resolve API key
     api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: No API key. Set --api-key or ANTHROPIC_API_KEY env variable.")
         sys.exit(1)
 
-    # Load construct definitions
     if not os.path.exists(args.constructs):
         print(f"ERROR: Construct definitions file not found: {args.constructs}")
         sys.exit(1)
     print(f"Loading construct definitions from: {args.constructs}")
     definitions = load_construct_definitions(args.constructs)
 
-    # Load articles
     if not os.path.exists(args.articles):
         print(f"ERROR: Articles file not found: {args.articles}")
         sys.exit(1)
     print(f"Loading articles from: {args.articles}")
     articles = load_articles(args.articles, pdf_dir=args.pdf_dir)
 
+    # Build fallback index from previously-processed studies
+    print(f"Loading fallback index from: {args.fallback_dir}")
+    fallback_index = load_fallback_index(args.fallback_dir)
+
     study_filter = set(args.study_id) if args.study_id else None
 
-    results = {}
+    results = {}        # study_id -> final r (may be fallback)
+    fallback_used = {}  # study_id -> fallback metadata
     skipped = []
 
     for article in articles:
@@ -1599,6 +1587,43 @@ def main():
             traceback.print_exc()
             r = None
 
+        if r is None:
+            # Try fallback: average aggregate_r from other studies with the same pair
+            pair_id = construct_def["pair_id"]
+            fb_r, fb_sources = compute_fallback_r(
+                pair_id, fallback_index, exclude_study_id=study_id
+            )
+            if fb_r is not None:
+                print(
+                    f"  [FALLBACK] No r values found — using mean of "
+                    f"{len(fb_sources)} matched study(ies) from {args.fallback_dir}: "
+                    f"r = {fb_r:.4f}"
+                )
+                for src in fb_sources:
+                    print(f"    • {src['study_id']}: aggregate_r = {src['aggregate_r']:.4f}")
+                r = fb_r
+                fallback_used[study_id] = {
+                    "pair_id": pair_id,
+                    "fallback_r": fb_r,
+                    "fallback_sources": fb_sources,
+                }
+
+                # Append fallback info to the result.json already written
+                result_path = os.path.join(save_dir, "result.json")
+                if os.path.exists(result_path):
+                    with open(result_path, encoding="utf-8") as _f:
+                        result_data = json.load(_f)
+                    result_data["fallback_used"] = True
+                    result_data["fallback_r"] = fb_r
+                    result_data["fallback_sources"] = fb_sources
+                    with open(result_path, "w", encoding="utf-8") as _f:
+                        json.dump(result_data, _f, indent=2)
+            else:
+                print(
+                    f"  [FALLBACK] No r values found and no matching studies in "
+                    f"{args.fallback_dir} for pair '{pair_id}' — leaving blank."
+                )
+
         results[study_id] = r
 
     # Merge with any existing submission CSV so incremental runs accumulate
@@ -1614,14 +1639,20 @@ def main():
     with open(args.outcsv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["studyid", "aggregateeffectsize"])
-        for study_id in sorted(results, key=lambda s: int(s.replace("study", "")) if s.replace("study", "").isdigit() else s):
+        for study_id in sorted(
+            results,
+            key=lambda s: int(s.replace("study", "")) if s.replace("study", "").isdigit() else s,
+        ):
             r = results[study_id]
             writer.writerow([study_id, "" if r is None else f"{r:.6f}"])
 
     print(f"\n{'═' * 60}")
     print(f"Results saved to {args.outcsv}")
     n_ok = sum(1 for r in results.values() if r is not None)
+    n_fb = len(fallback_used)
     print(f"  Processed: {n_ok}/{len(results)} studies with effect sizes")
+    if n_fb:
+        print(f"  Fallback used for {n_fb} study(ies): {list(fallback_used)}")
     if skipped:
         print(f"  Skipped (missing construct definition): {skipped}")
 
