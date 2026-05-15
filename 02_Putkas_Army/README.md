@@ -21,7 +21,7 @@
 
 This repo automates the extraction and aggregation of Pearson's *r* effect sizes from research PDFs for the SIOP 2026 ML Competition. The full design rationale, challenges, and lessons learned are documented in the accompanying slide deck. In short:
 
-- **Two-agent compression pattern.** A cheap, large-context Gemini extractor compresses each PDF into a small structured JSON of statistics. All compressed JSONs are then sent in a **single** Gemini Deep Research Agent call for cross-study aggregation. This kept us on the free tier through development (~$10 total spend) and avoided per-PDF Deep Research costs that could have run to ~$5/call.
+- **Two-agent compression pattern.** A cheap, large-context Gemini extractor compresses each PDF into a small structured JSON of statistics. All compressed JSONs are then sent in a **single** Gemini Deep Research Agent call for cross-study aggregation. This kept us on the free tier through development (~$10 total spend on test set attempts) and avoided per-PDF Deep Research costs that could have run to ~$5/call.
 - **Pydantic structured outputs** enforce a strict statistic schema (correlations, *d*, *g*, betas, *t*, *F*, chi-square, odds ratios, eta-squared, 2x2 tables, reliabilities, reverse-coding flags, etc.) to reduce hallucinations.
 - **Code-execution-driven aggregation.** The Deep Research Agent performs Fisher *z* -> mean -> inverse Fisher *z* via its code-execution tool to avoid arithmetic hallucinations.
 - **Domain expertise in the prompts.** Construct-specific inclusion rules and reverse-coding instructions are injected into both the per-PDF extraction prompt and the batched aggregation prompt.
