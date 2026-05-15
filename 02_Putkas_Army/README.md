@@ -126,7 +126,7 @@ A second variant with `null -> 0` fallback (`...na_to_0.csv`) is also written.
 pip install google-genai pandas numpy pydantic
 ```
 
-You will also need a Gemini API key with access to the Deep Research Agent (`deep-research-pro-preview-12-2025`).
+You will also need a Gemini API key (free or paid).
 
 ---
 
