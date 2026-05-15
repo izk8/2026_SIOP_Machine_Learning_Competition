@@ -146,9 +146,7 @@ You will also need a Gemini API key (free or paid).
    OUTPUT_DIRECTORY_PATH     = "../output_data/..."
    TEST_ARTICLES_CSV_PATH    = "../input_data/.../test_articles.csv"
    CONSTRUCT_DEFINTIONS_PATH = "../input_data/.../test_construct_definitions.csv"
-   DEEP_RESEARCH_RESEARCH_QUESTION_FOR_BATCH = (
-       "What is the bivariate association between [Construct1] and [Construct2]?"
-   )
+   DEEP_RESEARCH_RESEARCH_QUESTION_FOR_BATCH = "What is the bivariate association between [Construct1] and [Construct2]?"
    ```
 
 3. Run the pipeline:
