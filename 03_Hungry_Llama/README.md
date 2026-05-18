@@ -52,3 +52,9 @@
         - test_temp_post_processed.xlsx
     - Submission file:
         - test_submit_YYYYMMDD_HHmmss.csv
+     
+## Runtime Metrics
+
+For one pass through all 66 research articles in the **test** dataset:
+- Total runtime was ~2 hours 
+- Total cost was ~$2.00
